@@ -3,6 +3,7 @@ import { applyBody, applyExtraBlocks, applyHero, applyNamedBlocks } from "./cmsC
 import { applyDocuments, applyGallery, applySchedulePdf, setupLightbox } from "./cmsMedia";
 import { loadNews } from "./cmsNews";
 import { languageFromLocation, pageKeyFromLocation } from "./cmsRouting";
+import { applyPageSeo } from "./cmsSeo";
 import { trackVisit } from "./cmsVisits";
 import type { ContentSection, MediaFile } from "./types";
 
@@ -38,7 +39,9 @@ import type { ContentSection, MediaFile } from "./types";
     }
 
     const content = sections;
-    applyHero(content.find((item) => item.section_key === "hero"));
+    const hero = content.find((item) => item.section_key === "hero");
+    applyHero(hero);
+    applyPageSeo(hero, language, pageKey);
     applyBody(content.find((item) => item.section_key === "body"));
     applyNamedBlocks(content);
     applyExtraBlocks(content);

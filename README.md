@@ -23,7 +23,7 @@
 - `contacts.html` — контакты.
 - `news.html` — новости.
 
-Французская и английская версии временно закрыты на уровне общего скрипта `frontend/src/app.ts`.
+Французская и английская версии доступны и связаны с русскими страницами через языковое меню и SEO-атрибуты `hreflang`.
 
 ## Админ-панель
 
@@ -80,6 +80,19 @@ Backend endpoints:
 - `GET /api/services`.
 
 Актуальное расписание богослужений публикуется на сайте через CMS или PDF в разделе `Богослужения`.
+
+## SEO и Google Search Console
+
+Перед production-сборкой `frontend/scripts/generate-seo.mjs` автоматически обновляет canonical, `hreflang`, Open Graph, Twitter Card, Schema.org, `robots.txt` и `sitemap.xml` для домена `https://saint-michel-cannes.fr`.
+
+После деплоя:
+
+1. Добавьте в Google Search Console доменный ресурс `saint-michel-cannes.fr`.
+2. Подтвердите владение TXT-записью в DNS домена.
+3. Отправьте карту сайта `https://saint-michel-cannes.fr/sitemap.xml`.
+4. Проверьте главную страницу и новые статьи инструментом URL Inspection.
+
+Заголовок и краткое описание блока `hero`, изменяемые через админку, используются как динамические SEO-поля страницы. Для новости SEO формируется из заголовка, анонса и первой фотографии.
 
 ## Дизайн
 

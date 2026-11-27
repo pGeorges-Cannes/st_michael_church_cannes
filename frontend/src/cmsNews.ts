@@ -19,6 +19,81 @@ const notFoundLabels: Record<LanguageCode, string> = {
   en: "The news item was not found or is not published yet.",
 };
 
+const SITE_ORIGIN = "https://saint-michel-cannes.fr";
+
+function upsertMeta(selector: string, attribute: "name" | "property", key: string, content: string): void {
+  let node = document.head.querySelector<HTMLMetaElement>(selector);
+  if (!node) {
+    node = document.createElement("meta");
+    node.setAttribute(attribute, key);
+    document.head.appendChild(node);
+  }
+  node.content = content;
+}
+
+function upsertLink(selector: string, rel: string, href: string, hreflang?: string): void {
+  let node = document.head.querySelector<HTMLLinkElement>(selector);
+  if (!node) {
+    node = document.createElement("link");
+    node.rel = rel;
+    if (hreflang) node.hreflang = hreflang;
+    document.head.appendChild(node);
+  }
+  node.href = href;
+}
+
+function plainText(value: string | null | undefined): string {
+  const container = document.createElement("div");
+  container.innerHTML = richTextToHtml(value || "");
+  return (container.textContent || "").replace(/\s+/g, " ").trim();
+}
+
+function updateNewsSeo(item: ParishNews, photos: ParishNewsPhoto[], language: LanguageCode): void {
+  const suffix = language === "ru" ? "" : `-${language}`;
+  const canonical = `${SITE_ORIGIN}/news-detail${suffix}.html?id=${encodeURIComponent(item.id)}`;
+  const description = plainText(item.excerpt || item.body).slice(0, 200) || item.title;
+  const image = (photos || []).map((photo) => safePublicUrl(photo.file_url)).find(Boolean) || `${SITE_ORIGIN}/assets/seo-church.jpg`;
+  const title = `${item.title} | ${language === "ru" ? "Храм Архангела Михаила в Каннах" : language === "fr" ? "Église Saint-Michel-Archange à Cannes" : "St Michael the Archangel Church in Cannes"}`;
+
+  document.title = title;
+  upsertMeta('meta[name="description"]', "name", "description", description);
+  upsertMeta('meta[property="og:type"]', "property", "og:type", "article");
+  upsertMeta('meta[property="og:title"]', "property", "og:title", item.title);
+  upsertMeta('meta[property="og:description"]', "property", "og:description", description);
+  upsertMeta('meta[property="og:url"]', "property", "og:url", canonical);
+  upsertMeta('meta[property="og:image"]', "property", "og:image", image);
+  upsertMeta('meta[name="twitter:title"]', "name", "twitter:title", item.title);
+  upsertMeta('meta[name="twitter:description"]', "name", "twitter:description", description);
+  upsertMeta('meta[name="twitter:image"]', "name", "twitter:image", image);
+  upsertLink('link[rel="canonical"]', "canonical", canonical);
+
+  (["ru", "fr", "en"] as LanguageCode[]).forEach((code) => {
+    const codeSuffix = code === "ru" ? "" : `-${code}`;
+    upsertLink(`link[rel="alternate"][hreflang="${code}"]`, "alternate", `${SITE_ORIGIN}/news-detail${codeSuffix}.html?id=${encodeURIComponent(item.id)}`, code);
+  });
+  upsertLink('link[rel="alternate"][hreflang="x-default"]', "alternate", `${SITE_ORIGIN}/news-detail.html?id=${encodeURIComponent(item.id)}`, "x-default");
+
+  let schema = document.head.querySelector<HTMLScriptElement>("#news-structured-data");
+  if (!schema) {
+    schema = document.createElement("script");
+    schema.id = "news-structured-data";
+    schema.type = "application/ld+json";
+    document.head.appendChild(schema);
+  }
+  schema.textContent = JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "NewsArticle",
+    headline: item.title,
+    description,
+    datePublished: item.event_date,
+    inLanguage: language,
+    mainEntityOfPage: canonical,
+    image: [image],
+    author: { "@id": `${SITE_ORIGIN}/#church` },
+    publisher: { "@id": `${SITE_ORIGIN}/#church` }
+  });
+}
+
 function groupPhotos(photos: ParishNewsPhoto[] = []): PhotosByNews {
   return photos.reduce<PhotosByNews>((groups, photo) => {
     const key = photo.news_id;
@@ -142,7 +217,9 @@ async function loadNewsDetail(client: SupabaseClient, language: LanguageCode): P
     .eq("news_id", item.id)
     .order("sort_order", { ascending: true });
 
-  renderNewsDetail(item, (photos || []) as ParishNewsPhoto[], language);
+  const newsPhotos = (photos || []) as ParishNewsPhoto[];
+  updateNewsSeo(item, newsPhotos, language);
+  renderNewsDetail(item, newsPhotos, language);
 }
 
 export async function loadNews(client: SupabaseClient, language: LanguageCode): Promise<void> {
