@@ -10,7 +10,9 @@ const fontOptions = [
   ["Arial", "Arial"],
   ["Georgia", "Georgia"],
   ["Times New Roman", "Times"],
-  ["Oglavie, Georgia, serif", "Church"]
+  ["Oglavie", "Oglavie (RU)"],
+  ["Cormorant SC Parish", "Cormorant SC (FR/EN)"],
+  ["Uncial Antiqua Parish", "Uncial Antiqua (FR/EN)"]
 ];
 
 const sizeOptions = [
