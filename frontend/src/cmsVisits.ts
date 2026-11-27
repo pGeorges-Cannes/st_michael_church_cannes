@@ -119,7 +119,27 @@ function isBot(): boolean {
 }
 
 async function insertDirectly(client: SupabaseClient, payload: Record<string, unknown>): Promise<void> {
-  const result = await client.from("page_visits").insert(payload) as { error?: { message?: string } } | undefined;
+  let countryCode = "";
+  try {
+    const response = await fetch("https://api.country.is/", { cache: "no-store" });
+    const data = response.ok ? await response.json() : {};
+    countryCode = /^[A-Z]{2}$/.test(data.country || "") ? data.country : "";
+  } catch {
+    // Country remains unknown when the independent geo service is unavailable.
+  }
+  let countryName = "";
+  if (countryCode) {
+    try {
+      countryName = new Intl.DisplayNames(["ru"], { type: "region" }).of(countryCode) || countryCode;
+    } catch {
+      countryName = countryCode;
+    }
+  }
+  const result = await client.from("page_visits").insert({
+    ...payload,
+    country_code: countryCode || null,
+    country_name: countryName || null
+  }) as { error?: { message?: string } } | undefined;
   if (result?.error) throw new Error(result.error.message || "Visit insert failed");
 }
 
