@@ -8,16 +8,26 @@ type SupabaseClient = {
   from: (table: string) => SupabaseQuery;
 };
 
-interface VisitorSession {
-  id: string;
-  isNew: boolean;
+interface VisitorIdentity {
+  visitorId: string;
+  sessionId: string;
+  isNewVisitor: boolean;
   firstSeenAt: string;
   landingPage: string;
 }
 
-const SESSION_KEY = "st_michael_visit_session";
+interface StoredSession {
+  id: string;
+  landingPage: string;
+  lastSeenAt: number;
+}
+
+const VISITOR_KEY = "st_michael_visitor_id";
+const LEGACY_VISITOR_KEY = "st_michael_visit_session";
+const SESSION_KEY = "st_michael_active_session";
 const FIRST_SEEN_KEY = "st_michael_first_seen_at";
-const LANDING_PAGE_KEY = "st_michael_landing_page";
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_BACKEND_URL = "https://st-michael-church-cannes.onrender.com";
 
 function safeStorageGet(key: string): string {
   try {
@@ -31,32 +41,50 @@ function safeStorageSet(key: string, value: string): void {
   try {
     window.localStorage.setItem(key, value);
   } catch {
-    // Ignore browsers that block localStorage.
+    // Statistics must also work in browsers that block localStorage.
   }
 }
 
-function visitorSession(): VisitorSession {
-  let id = safeStorageGet(SESSION_KEY);
+function newId(): string {
+  return window.crypto?.randomUUID ? window.crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+}
+
+function readSession(): StoredSession | null {
+  try {
+    const value = JSON.parse(safeStorageGet(SESSION_KEY));
+    if (!value?.id || !value?.lastSeenAt) return null;
+    return value as StoredSession;
+  } catch {
+    return null;
+  }
+}
+
+function visitorIdentity(): VisitorIdentity {
+  const now = Date.now();
+  let visitorId = safeStorageGet(VISITOR_KEY) || safeStorageGet(LEGACY_VISITOR_KEY);
   let firstSeenAt = safeStorageGet(FIRST_SEEN_KEY);
-  let landingPage = safeStorageGet(LANDING_PAGE_KEY);
-  const isNew = !id || !firstSeenAt;
+  const isNewVisitor = !visitorId || !firstSeenAt;
 
-  if (!id) {
-    id = window.crypto?.randomUUID ? window.crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
-    safeStorageSet(SESSION_KEY, id);
+  if (!visitorId) visitorId = newId();
+  if (!firstSeenAt) firstSeenAt = new Date(now).toISOString();
+  safeStorageSet(VISITOR_KEY, visitorId);
+  safeStorageSet(FIRST_SEEN_KEY, firstSeenAt);
+
+  let session = readSession();
+  if (!session || now - session.lastSeenAt > SESSION_TIMEOUT_MS) {
+    session = { id: newId(), landingPage: window.location.pathname, lastSeenAt: now };
+  } else {
+    session.lastSeenAt = now;
   }
+  safeStorageSet(SESSION_KEY, JSON.stringify(session));
 
-  if (!firstSeenAt) {
-    firstSeenAt = new Date().toISOString();
-    safeStorageSet(FIRST_SEEN_KEY, firstSeenAt);
-  }
-
-  if (!landingPage) {
-    landingPage = window.location.pathname;
-    safeStorageSet(LANDING_PAGE_KEY, landingPage);
-  }
-
-  return { id, isNew, firstSeenAt, landingPage };
+  return {
+    visitorId,
+    sessionId: session.id,
+    isNewVisitor,
+    firstSeenAt,
+    landingPage: session.landingPage
+  };
 }
 
 function detectDevice(): string {
@@ -86,68 +114,48 @@ function detectOs(): string {
   return "Other";
 }
 
-function detectCountry(timezone: string, language: string): { code: string; name: string } {
-  const normalizedLanguage = language.toLowerCase();
-  const timezoneMap: Record<string, { code: string; name: string }> = {
-    "Europe/Paris": { code: "FR", name: "Франция" },
-    "Europe/Monaco": { code: "MC", name: "Монако" },
-    "Europe/Moscow": { code: "RU", name: "Россия" },
-    "Europe/Berlin": { code: "DE", name: "Германия" },
-    "Europe/Rome": { code: "IT", name: "Италия" },
-    "Europe/Madrid": { code: "ES", name: "Испания" },
-    "Europe/London": { code: "GB", name: "Великобритания" },
-    "Europe/Brussels": { code: "BE", name: "Бельгия" },
-    "Europe/Zurich": { code: "CH", name: "Швейцария" },
-    "America/New_York": { code: "US", name: "США" },
-    "America/Los_Angeles": { code: "US", name: "США" },
-    "Asia/Jerusalem": { code: "IL", name: "Израиль" }
-  };
-
-  if (timezoneMap[timezone]) return timezoneMap[timezone];
-  if (normalizedLanguage.endsWith("-fr")) return { code: "FR", name: "Франция" };
-  if (normalizedLanguage.endsWith("-ru")) return { code: "RU", name: "Россия" };
-  if (normalizedLanguage.endsWith("-en")) return { code: "GB", name: "Англоязычные пользователи" };
-  return { code: "", name: "Не определено" };
+function isBot(): boolean {
+  return /bot|crawler|spider|headless|lighthouse|preview|facebookexternalhit|whatsapp/i.test(navigator.userAgent || "");
 }
 
-async function insertVisit(client: SupabaseClient, payload: Record<string, unknown>, fallback: Record<string, unknown>): Promise<void> {
+async function insertDirectly(client: SupabaseClient, payload: Record<string, unknown>): Promise<void> {
   const result = await client.from("page_visits").insert(payload) as { error?: { message?: string } } | undefined;
-  if (result?.error) {
-    await client.from("page_visits").insert(fallback);
+  if (result?.error) throw new Error(result.error.message || "Visit insert failed");
+}
+
+async function insertThroughBackend(payload: Record<string, unknown>): Promise<boolean> {
+  const backendUrl = (window.ST_MICHAEL_BACKEND_URL || DEFAULT_BACKEND_URL).replace(/\/$/, "");
+  try {
+    const response = await fetch(`${backendUrl}/api/visits`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      keepalive: true
+    });
+    return response.ok;
+  } catch {
+    return false;
   }
 }
 
 export async function trackVisit(client: SupabaseClient, pageKey: string, language: LanguageCode): Promise<void> {
   const file = window.location.pathname.split("/").pop() || "index.html";
-  if (file === "admin.html") return;
+  if (file === "admin.html" || isBot()) return;
 
-  const session = visitorSession();
-  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
-  const visitorLanguage = navigator.language || "";
-  const country = detectCountry(timezone, visitorLanguage);
-  const referrer = document.referrer ? document.referrer.slice(0, 500) : "";
-  const userAgent = navigator.userAgent ? navigator.userAgent.slice(0, 500) : "";
-  const pagePath = window.location.pathname;
-
-  const fallbackPayload = {
+  const identity = visitorIdentity();
+  const payload = {
     page_key: pageKey,
-    page_path: pagePath,
+    page_path: window.location.pathname,
     language,
-    session_id: session.id,
-    referrer,
-    user_agent: userAgent
-  };
-
-  const extendedPayload = {
-    ...fallbackPayload,
-    visitor_id: session.id,
-    is_new_session: session.isNew,
-    first_seen_at: session.firstSeenAt,
-    landing_page: session.landingPage,
-    timezone,
-    visitor_language: visitorLanguage.slice(0, 40),
-    country_code: country.code,
-    country_name: country.name,
+    session_id: identity.sessionId,
+    visitor_id: identity.visitorId,
+    is_new_session: identity.isNewVisitor,
+    first_seen_at: identity.firstSeenAt,
+    landing_page: identity.landingPage,
+    referrer: document.referrer ? document.referrer.slice(0, 500) : "",
+    user_agent: navigator.userAgent ? navigator.userAgent.slice(0, 500) : "",
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+    visitor_language: (navigator.language || "").slice(0, 40),
     device_type: detectDevice(),
     browser_name: detectBrowser(),
     os_name: detectOs(),
@@ -156,7 +164,7 @@ export async function trackVisit(client: SupabaseClient, pageKey: string, langua
   };
 
   try {
-    await insertVisit(client, extendedPayload, fallbackPayload);
+    if (!await insertThroughBackend(payload)) await insertDirectly(client, payload);
   } catch {
     // Statistics must never block public page rendering.
   }

@@ -33,6 +33,7 @@ interface PeriodRange {
 
 const VISIT_PAGE_SIZE = 1000;
 const VISIT_MAX_PAGES = 250;
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 
 function requiredElement<T extends HTMLElement>(lookup: (id: string) => HTMLElement | null, id: string): T {
   const element = lookup(id);
@@ -60,7 +61,10 @@ function formatStatsDate(value: string | null | undefined): string {
 }
 
 function dayKey(date: Date): string {
-  return date.toISOString().slice(0, 10);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function formatDayLabel(value: string): string {
@@ -116,6 +120,14 @@ function isPublicVisit(visit: PageVisit): boolean {
   return visit.page_path !== "/admin.html";
 }
 
+function isAutomatedVisit(visit: PageVisit): boolean {
+  return /bot|crawler|spider|headless|lighthouse|preview|facebookexternalhit/i.test(visit.user_agent || "");
+}
+
+function visitorKey(visit: PageVisit): string {
+  return visit.visitor_id || visit.session_id || visit.id;
+}
+
 function isVisitInRange(visit: PageVisit, start: Date | null, end: Date): boolean {
   const created = parseDate(visit.created_at);
   if (!created) return false;
@@ -130,16 +142,26 @@ function buildSessions(visits: PageVisit[], periodStart: Date | null, periodEnd:
     grouped.get(key)?.push(visit);
   });
 
-  return Array.from(grouped.entries()).map(([sessionId, sessionVisits]) => {
+  return Array.from(grouped.entries()).flatMap(([baseSessionId, sessionVisits]) => {
     const sorted = sessionVisits
       .slice()
       .sort((a, b) => (parseDate(a.created_at)?.getTime() || 0) - (parseDate(b.created_at)?.getTime() || 0));
-    const firstKnown = sorted[0];
-    const explicitFirstSeen = parseDate(firstKnown?.first_seen_at || null);
-    const firstSeen = explicitFirstSeen || parseDate(firstKnown?.created_at) || new Date();
-    const periodVisits = sorted.filter((visit) => isVisitInRange(visit, periodStart, periodEnd));
+    const chunks: PageVisit[][] = [];
+    sorted.forEach((visit) => {
+      const current = chunks[chunks.length - 1];
+      const previousTime = current?.length ? parseDate(current[current.length - 1].created_at)?.getTime() : null;
+      const currentTime = parseDate(visit.created_at)?.getTime();
+      if (!current || !previousTime || !currentTime || currentTime - previousTime > SESSION_TIMEOUT_MS) chunks.push([visit]);
+      else current.push(visit);
+    });
 
-    return { sessionId, visits: sorted, firstSeen, periodVisits };
+    return chunks.map((chunk, index) => {
+      const firstKnown = chunk[0];
+      const explicitFirstSeen = parseDate(firstKnown?.first_seen_at || null);
+      const firstSeen = explicitFirstSeen || parseDate(firstKnown?.created_at) || new Date();
+      const periodVisits = chunk.filter((visit) => isVisitInRange(visit, periodStart, periodEnd));
+      return { sessionId: `${baseSessionId}:${index}`, visits: chunk, firstSeen, periodVisits };
+    });
   });
 }
 
@@ -187,20 +209,6 @@ function renderDailyChart(targetId: string, visits: PageVisit[], days: number): 
       <small>${escapeHtml(formatDayLabel(date))}</small>
     </div>
   `).join("");
-}
-
-async function countVisits(client: SupabaseClientLike, start: Date | null, end: Date): Promise<number> {
-  let query = client
-    .from("page_visits")
-    .select("id", { count: "exact", head: true })
-    .neq("page_path", "/admin.html")
-    .lt("created_at", end.toISOString());
-
-  if (start) query = query.gte("created_at", start.toISOString());
-
-  const { count, error } = await query;
-  if (error) throw error;
-  return count || 0;
 }
 
 async function fetchVisits(client: SupabaseClientLike, start: Date | null): Promise<PageVisit[]> {
@@ -268,17 +276,8 @@ export function createAdminStats(options: AdminStatsOptions) {
     if (lookupStart) lookupStart.setDate(lookupStart.getDate() - lookupDays);
 
     let allVisits: PageVisit[] = [];
-    let periodVisitCount = 0;
-    let todayVisitCount = 0;
-
     try {
-      const todayStart = new Date();
-      todayStart.setHours(0, 0, 0, 0);
-      [allVisits, periodVisitCount, todayVisitCount] = await Promise.all([
-        fetchVisits(client, lookupStart),
-        countVisits(client, periodStart, periodEnd),
-        countVisits(client, todayStart, new Date())
-      ]);
+      allVisits = (await fetchVisits(client, lookupStart)).filter((visit) => !isAutomatedVisit(visit));
     } catch (error) {
       const message = error instanceof Error ? error.message : "неизвестная ошибка";
       options.setText("editor-status", `Ошибка чтения статистики: ${message}`);
@@ -289,19 +288,36 @@ export function createAdminStats(options: AdminStatsOptions) {
     }
 
     const periodVisits = allVisits.filter((visit) => isVisitInRange(visit, periodStart, periodEnd));
+    const periodVisitCount = periodVisits.length;
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayVisitCount = allVisits.filter((visit) => isVisitInRange(visit, todayStart, new Date())).length;
     const sessions = buildSessions(allVisits, periodStart, periodEnd).filter((session) => session.periodVisits.length > 0);
     const uniqueSessions = sessions.length;
-    const newSessions = sessions.filter((session) => !periodStart || session.firstSeen >= periodStart).length;
-    const returningSessions = Math.max(0, uniqueSessions - newSessions);
+    const periodVisitors = new Map<string, PageVisit[]>();
+    periodVisits.forEach((visit) => {
+      const key = visitorKey(visit);
+      if (!periodVisitors.has(key)) periodVisitors.set(key, []);
+      periodVisitors.get(key)?.push(visit);
+    });
+    let newVisitors = 0;
+    let returningVisitors = 0;
+    periodVisitors.forEach((visits) => {
+      const firstSeen = parseDate(visits[0]?.first_seen_at) || parseDate(visits[visits.length - 1]?.created_at);
+      if (!periodStart || (firstSeen && firstSeen >= periodStart && firstSeen < periodEnd)) newVisitors += 1;
+      else returningVisitors += 1;
+    });
     const bouncedSessions = sessions.filter((session) => session.periodVisits.length <= 1).length;
     const onlineSince = new Date(Date.now() - 5 * 60 * 1000);
-    const onlineSessions = new Set(periodVisits.filter((visit) => {
+    const onlineVisitors = new Set(periodVisits.filter((visit) => {
       const created = parseDate(visit.created_at);
       return created ? created >= onlineSince : false;
-    }).map(sessionKey));
+    }).map(visitorKey));
 
     const topPages = topRows(countBy(periodVisits, (visit) => pageLabel(visit.page_path, visit.page_key)), 10, periodVisitCount);
-    const countryRows = topRows(countBy(periodVisits, (visit) => visit.country_name || visit.country_code || "Не определено"), 10, periodVisitCount);
+    const knownCountryVisits = periodVisits.filter((visit) => Boolean(visit.country_code || visit.country_name));
+    const unknownCountryCount = periodVisitCount - knownCountryVisits.length;
+    const countryRows = topRows(countBy(knownCountryVisits, (visit) => visit.country_name || visit.country_code || ""), 10, knownCountryVisits.length);
     const referrerRows = topRows(countBy(periodVisits, (visit) => externalReferrer(visit.referrer)), 10, periodVisitCount);
     const deviceRows = topRows(countBy(periodVisits, (visit) => visit.device_type || "Не определено"), 8, periodVisitCount);
     const languageRows = topRows(countBy(periodVisits, (visit) => visit.visitor_language || visit.language || "Не определено"), 8, periodVisitCount);
@@ -319,12 +335,20 @@ export function createAdminStats(options: AdminStatsOptions) {
     options.setText("stats-today", String(todayVisitCount));
     options.setText("stats-total", String(periodVisitCount));
     options.setText("stats-unique", String(uniqueSessions));
-    options.setText("stats-online", String(onlineSessions.size));
-    options.setText("stats-new", String(newSessions));
-    options.setText("stats-returning", String(returningSessions));
+    options.setText("stats-online", String(onlineVisitors.size));
+    options.setText("stats-new", String(newVisitors));
+    options.setText("stats-returning", String(returningVisitors));
     options.setText("stats-bounce", String(bouncedSessions));
     options.setText("stats-bounce-rate", `${uniqueSessions ? Math.round((bouncedSessions / uniqueSessions) * 100) : 0}%`);
     options.setText("stats-pages", String(new Set(periodVisits.map((visit) => pageLabel(visit.page_path, visit.page_key))).size));
+    const geoCoverage = periodVisitCount ? Math.round((knownCountryVisits.length / periodVisitCount) * 100) : 0;
+    options.setText("stats-geo-coverage", `${geoCoverage}%`);
+    options.setText(
+      "stats-geo-note",
+      unknownCountryCount
+        ? `${unknownCountryCount} просмотров без географии. Большая часть — исторические данные, перенесённые до серверного определения стран.`
+        : "Страна определена для всех просмотров выбранного периода."
+    );
 
     renderRows("stats-top-pages", topPages, "Посещений пока нет.");
     renderRows("stats-countries", countryRows, "Страны пока не определены.");

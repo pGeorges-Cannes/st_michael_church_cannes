@@ -1,7 +1,7 @@
 const http = require("node:http");
 
 const PORT = Number(process.env.PORT || 10000);
-const RELEASE_ID = "translate-cors-custom-domain-2026-09-22";
+const RELEASE_ID = "analytics-geo-sessions-2026-11-27";
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -94,6 +94,128 @@ function corsHeaders(request) {
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
   };
+}
+
+function requestOriginIsAllowed(request) {
+  const origin = normalizeOrigin(request.headers.origin || "");
+  return !origin || allowedOrigin(request) === origin;
+}
+
+function safeText(value, maxLength) {
+  return String(value || "").trim().slice(0, maxLength);
+}
+
+function countryName(code) {
+  if (!code || !/^[A-Z]{2}$/.test(code)) return "";
+  try {
+    return new Intl.DisplayNames(["ru"], { type: "region" }).of(code) || code;
+  } catch {
+    return code;
+  }
+}
+
+function countryFromHeaders(request) {
+  const candidates = [
+    request.headers["cf-ipcountry"],
+    request.headers["x-vercel-ip-country"],
+    request.headers["cloudfront-viewer-country"],
+    request.headers["x-country-code"]
+  ];
+  return candidates
+    .map((value) => safeText(value, 2).toUpperCase())
+    .find((value) => /^[A-Z]{2}$/.test(value) && value !== "XX") || "";
+}
+
+function clientIp(request) {
+  const forwarded = safeText(request.headers["x-forwarded-for"], 200).split(",")[0].trim();
+  return forwarded || safeText(request.socket.remoteAddress, 80).replace(/^::ffff:/, "");
+}
+
+async function resolveCountry(request) {
+  const headerCode = countryFromHeaders(request);
+  if (headerCode) return headerCode;
+
+  const ip = clientIp(request);
+  if (!ip || /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$)/.test(ip)) return "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1800);
+  try {
+    const result = await fetch(`https://api.country.is/${encodeURIComponent(ip)}`, { signal: controller.signal });
+    if (!result.ok) return "";
+    const data = await result.json();
+    const code = safeText(data.country, 2).toUpperCase();
+    return /^[A-Z]{2}$/.test(code) ? code : "";
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizeVisitPayload(body) {
+  const languages = new Set(["ru", "fr", "en"]);
+  return {
+    page_key: safeText(body.page_key, 100),
+    page_path: safeText(body.page_path, 300),
+    language: languages.has(body.language) ? body.language : "ru",
+    session_id: safeText(body.session_id, 100),
+    visitor_id: safeText(body.visitor_id, 100),
+    is_new_session: Boolean(body.is_new_session),
+    first_seen_at: safeText(body.first_seen_at, 40) || null,
+    landing_page: safeText(body.landing_page, 300),
+    referrer: safeText(body.referrer, 500),
+    user_agent: safeText(body.user_agent, 500),
+    timezone: safeText(body.timezone, 100),
+    visitor_language: safeText(body.visitor_language, 40),
+    device_type: safeText(body.device_type, 20),
+    browser_name: safeText(body.browser_name, 40),
+    os_name: safeText(body.os_name, 40),
+    screen_width: Number.isFinite(Number(body.screen_width)) ? Math.max(0, Math.min(20000, Number(body.screen_width))) : null,
+    screen_height: Number.isFinite(Number(body.screen_height)) ? Math.max(0, Math.min(20000, Number(body.screen_height))) : null
+  };
+}
+
+async function recordVisit(request, response) {
+  if (!requestOriginIsAllowed(request)) {
+    sendJson(request, response, 403, { ok: false, error: "Origin is not allowed" });
+    return;
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    sendJson(request, response, 503, { ok: false, error: "Visit storage is not configured" });
+    return;
+  }
+
+  const payload = normalizeVisitPayload(await readJson(request));
+  if (!payload.page_path || !payload.session_id || !payload.visitor_id || /admin\.html$/i.test(payload.page_path)) {
+    sendJson(request, response, 400, { ok: false, error: "Invalid visit payload" });
+    return;
+  }
+  if (/bot|crawler|spider|headless|lighthouse|preview/i.test(payload.user_agent)) {
+    sendJson(request, response, 202, { ok: true, ignored: "automated client" });
+    return;
+  }
+
+  const countryCode = await resolveCountry(request);
+  const storageResponse = await fetch(`${SUPABASE_URL}/rest/v1/page_visits`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal"
+    },
+    body: JSON.stringify({
+      ...payload,
+      country_code: countryCode || null,
+      country_name: countryCode ? countryName(countryCode) : null
+    })
+  });
+  if (!storageResponse.ok) {
+    const details = await storageResponse.text().catch(() => "");
+    sendJson(request, response, 502, { ok: false, error: `Visit storage failed: ${details.slice(0, 180)}` });
+    return;
+  }
+  sendJson(request, response, 201, { ok: true, countryResolved: Boolean(countryCode) });
 }
 
 function sendJson(request, response, statusCode, payload) {
@@ -276,7 +398,7 @@ function translationStatusPayload(request) {
     releaseId: RELEASE_ID,
     requestOrigin: normalizeOrigin(request.headers.origin || ""),
     resolvedCorsOrigin: allowedOrigin(request),
-    routes: ["/healthz", "/api/translate", "/api/translate/status", "/status"],
+    routes: ["/healthz", "/api/visits", "/api/translate", "/api/translate/status", "/status"],
     translation: {
       openaiApiKeyConfigured: Boolean(OPENAI_API_KEY),
       openaiModel: OPENAI_MODEL,
@@ -305,6 +427,11 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && pathname === "/api/translate") {
       await translateBlock(request, response);
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/api/visits") {
+      await recordVisit(request, response);
       return;
     }
 
@@ -346,7 +473,7 @@ const server = http.createServer(async (request, response) => {
       error: "Route not found in st-michael-cannes-backend",
       releaseId: RELEASE_ID,
       path: pathname,
-      availableRoutes: ["/healthz", "/api/site", "/api/services", "/api/translate/status", "/status", "POST /api/translate"]
+      availableRoutes: ["/healthz", "/api/site", "/api/services", "/api/translate/status", "/status", "POST /api/translate", "POST /api/visits"]
     });
   } catch (error) {
     sendJson(request, response, 500, {
